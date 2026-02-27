@@ -306,39 +306,47 @@ def send_hourly_summary():
 # Market Status Reminder
 # ==============================
 def _next_market_open(now):
-    """Next NSE open (09:15 IST) on a weekday."""
-    market_open, _ = _market_hours(now)
+    """Next NSE open (09:15 IST) on a weekday. Skips Sat/Sun."""
+    market_open, market_close = _market_hours(now)
+    # Before 09:15 today and today is Mon–Fri → open today
     if now.weekday() < 5 and now < market_open:
-        return market_open  # Today 09:15
-    # After close or weekend: next weekday at 09:15
-    for days_ahead in range(1, 8):
+        return market_open
+    # After 15:30 or weekend → next trading day (Mon–Fri only)
+    # Python: Mon=0, Fri=4, Sat=5, Sun=6
+    days_ahead = 1
+    while True:
         next_date = now.date() + timedelta(days=days_ahead)
-        if next_date.weekday() < 5:
-            return now.replace(
-                year=next_date.year, month=next_date.month, day=next_date.day,
-                hour=MARKET_OPEN_TIME[0], minute=MARKET_OPEN_TIME[1], second=0, microsecond=0,
-            )
-    return market_open
+        if next_date.weekday() <= 4:  # Monday=0 .. Friday=4
+            break
+        days_ahead += 1
+    return now.replace(
+        year=next_date.year, month=next_date.month, day=next_date.day,
+        hour=MARKET_OPEN_TIME[0], minute=MARKET_OPEN_TIME[1], second=0, microsecond=0,
+    )
 
 
 def market_status_reminder():
     now = datetime.now(IST)
     market_open, market_close = _market_hours(now)
     if now.weekday() >= 5:
-        # Weekend: next open is Monday 09:15
         next_open = _next_market_open(now)
         delta = next_open - now
         hours_left = round(delta.total_seconds() / 3600, 1)
-        send_telegram(f"⏰ NSE closed (weekend). Opens in {hours_left} hrs.")
+        next_str = next_open.strftime("%A %d %b at %I:%M %p IST")
+        send_telegram(f"⏰ NSE closed (weekend). Opens in {hours_left} hrs → {next_str}")
     elif now < market_open:
-        delta = market_open - now
+        next_open = _next_market_open(now)
+        delta = next_open - now
         hours_left = round(delta.total_seconds() / 3600, 1)
-        send_telegram(f"⏰ Market closed. Opens in {hours_left} hrs.")
+        next_str = next_open.strftime("%A %d %b at %I:%M %p IST")
+        send_telegram(f"⏰ Market closed. Opens in {hours_left} hrs → {next_str}")
     elif now > market_close:
         next_open = _next_market_open(now)
         delta = next_open - now
         hours_left = round(delta.total_seconds() / 3600, 1)
-        send_telegram(f"⏰ Market closed. Opens in {hours_left} hrs.")
+        next_str = next_open.strftime("%A %d %b at %I:%M %p IST")
+        # Friday evening → next open is Monday (not Saturday)
+        send_telegram(f"⏰ Market closed. Next trading day in {hours_left} hrs → {next_str}")
 
 # ==============================
 # Scheduler Setup
