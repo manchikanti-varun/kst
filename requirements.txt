@@ -6,3 +6,4 @@ schedule
 flask
 pytz
 python-dotenv
+gunicorn

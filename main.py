@@ -22,6 +22,7 @@ MARKET_OPEN_TIME = (9, 15)   # 09:15 IST
 MARKET_CLOSE_TIME = (15, 30) # 15:30 IST
 CHECK_INTERVAL_MINUTES = 45
 FETCH_DELAY_SECONDS = 0.5    # delay between symbol fetches to avoid rate limits
+PORT = int(os.getenv("PORT", "5000"))
 
 # Telegram (from .env or Render ENV)
 # CHAT_ID: single ID or comma-separated (e.g. 123456,789012) for multiple recipients
@@ -342,25 +343,27 @@ def market_status_reminder():
 # ==============================
 def run_scheduler():
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(check_crossovers)
-    schedule.every().hour.at(":00").do(send_hourly_summary)  # hourly summary
-    schedule.every().hour.at(":00").do(market_status_reminder)  # market reminder
+    schedule.every().hour.at(":00").do(send_hourly_summary)
+    schedule.every().hour.at(":00").do(market_status_reminder)
     while True:
         schedule.run_pending()
         time.sleep(5)
+
+
+def _start_background_scheduler():
+    """Start scheduler thread (runs on import so gunicorn + scheduler work)."""
+    t = threading.Thread(target=run_scheduler, daemon=True)
+    t.start()
+    log.info("Scheduler started at %s", datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"))
+    log.info("Monitoring %d symbols (every %s min)", len(symbols), CHECK_INTERVAL_MINUTES)
+    send_telegram("🚀 Trading Bot Started and Running 24/7!")
+
+
+# Start scheduler when module loads (works with both gunicorn and python main.py)
+_start_background_scheduler()
 
 # ==============================
 # Main Entry
 # ==============================
 if __name__ == "__main__":
-    log.info("Scheduler started at %s", datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"))
-    log.info("Monitoring %d symbols (every %s min)", len(symbols), CHECK_INTERVAL_MINUTES)
-
-    # Start scheduler in background
-    t = threading.Thread(target=run_scheduler, daemon=True)
-    t.start()
-
-    # Send startup message
-    send_telegram("🚀 Trading Bot Started and Running 24/7!")
-
-    # Start Flask server (for Render health check)
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
