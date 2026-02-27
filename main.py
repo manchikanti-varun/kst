@@ -307,26 +307,33 @@ def send_hourly_summary():
 # ==============================
 def _next_market_open(now):
     """Next NSE open (09:15 IST) on a weekday. Skips Sat/Sun."""
+    # Ensure we work in IST (in case server is UTC)
+    if now.tzinfo is None:
+        now = IST.localize(now)
+    else:
+        now = now.astimezone(IST)
     market_open, market_close = _market_hours(now)
     # Before 09:15 today and today is Mon–Fri → open today
     if now.weekday() < 5 and now < market_open:
         return market_open
-    # After 15:30 or weekend → next trading day (Mon–Fri only)
-    # Python: Mon=0, Fri=4, Sat=5, Sun=6
+    # After 15:30 or weekend → next trading day only (Mon=0 .. Fri=4, skip Sat=5, Sun=6)
     days_ahead = 1
-    while True:
+    for _ in range(7):
         next_date = now.date() + timedelta(days=days_ahead)
-        if next_date.weekday() <= 4:  # Monday=0 .. Friday=4
-            break
+        wd = next_date.weekday()  # Mon=0, Tue=1, ..., Fri=4, Sat=5, Sun=6
+        if wd <= 4:
+            next_open_naive = datetime(
+                next_date.year, next_date.month, next_date.day,
+                MARKET_OPEN_TIME[0], MARKET_OPEN_TIME[1], 0, 0,
+            )
+            return IST.localize(next_open_naive)
         days_ahead += 1
-    return now.replace(
-        year=next_date.year, month=next_date.month, day=next_date.day,
-        hour=MARKET_OPEN_TIME[0], minute=MARKET_OPEN_TIME[1], second=0, microsecond=0,
-    )
+    return market_open
 
 
 def market_status_reminder():
-    now = datetime.now(IST)
+    # Use UTC then convert to IST so server timezone (e.g. Railway UTC) doesn't affect result
+    now = datetime.now(pytz.UTC).astimezone(IST)
     market_open, market_close = _market_hours(now)
     if now.weekday() >= 5:
         next_open = _next_market_open(now)
