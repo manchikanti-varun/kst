@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import logging
 from collections import Counter
@@ -34,6 +35,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,  # stdout so Railway shows as info, not error
 )
 log = logging.getLogger(__name__)
 
