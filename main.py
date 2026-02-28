@@ -46,7 +46,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    now_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    now_ist = datetime.now(pytz.UTC).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     return jsonify({
         "status": "running",
         "time": now_ist,
@@ -57,7 +57,7 @@ def home():
 def health():
     return jsonify({
         "status": "ok",
-        "time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+        "time": datetime.now(pytz.UTC).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
     })
 
 # ==============================
@@ -196,25 +196,19 @@ def _market_hours(now):
     return open_, close
 
 
-def _is_market_open(now=None):
-    """True if we should run crossover check.
-    Mon–Fri: only during NSE hours (09:15–15:30 IST).
-    Sat–Sun: always run (commodities like Gold/Silver trade on global markets)."""
-    now = now or datetime.now(IST)
-    market_open, market_close = _market_hours(now)
-    if now.weekday() >= 5:  # Saturday=5, Sunday=6
-        return True   # Weekend: run for global commodities (TVC:GOLD, etc.)
-    return market_open <= now <= market_close
-
-
 def _crossover_direction(kst, signal):
-    """Returns 'bullish', 'bearish', or None if no crossover on last bar."""
+    """Returns 'bullish', 'bearish', or None if no crossover on last bar.
+    KST above signal = bullish, KST below signal = bearish. Ignores NaN."""
     if kst is None or signal is None or len(kst) < 2:
         return None
-    prev_below = kst.iloc[-2] < signal.iloc[-2]
-    curr_above = kst.iloc[-1] > signal.iloc[-1]
-    prev_above = kst.iloc[-2] > signal.iloc[-2]
-    curr_below = kst.iloc[-1] < signal.iloc[-1]
+    p_k, p_s = kst.iloc[-2], signal.iloc[-2]
+    c_k, c_s = kst.iloc[-1], signal.iloc[-1]
+    if pd.isna(p_k) or pd.isna(p_s) or pd.isna(c_k) or pd.isna(c_s):
+        return None
+    prev_below = p_k < p_s
+    curr_above = c_k > c_s
+    prev_above = p_k > p_s
+    curr_below = c_k < c_s
     if prev_below and curr_above:
         return "bullish"
     if prev_above and curr_below:
@@ -227,16 +221,20 @@ def _strength_from_count(n):
     return STRENGTH_BY_COUNT.get(n, "Mild")
 
 
+def _strength_emoji(strength):
+    """Visual indicator for signal strength."""
+    return {"Strong": "🔥", "Medium": "◀️", "Mild": "▪️"}.get(strength, "▪️")
+
+
 def check_crossovers():
+    """Run 24/7. Any crossover → one alert per new candle (no 9:15–15:30 restriction, no spam)."""
     global _last_alerted_bar
-    now = datetime.now(IST)
-    if not _is_market_open(now):
-        log.info("Market closed (outside 09:15–15:30 IST Mon–Fri), skipping crossover check")
-        return
+    now = datetime.now(pytz.UTC).astimezone(IST)
     for symbol in symbols:
         try:
             bullish_tfs = []
             bearish_tfs = []
+            latest_close = None
             for tf_name, tf_config in TIMEFRAMES.items():
                 df = get_data(symbol, tf_config["interval"], tf_config["period"])
                 if df is None or df.empty or len(df) < 2:
@@ -248,33 +246,60 @@ def check_crossovers():
                 direction = _crossover_direction(kst, signal)
                 if not direction:
                     continue
-                # Only alert on a NEW candle: avoid same crossover every min when market closed
                 current_bar = df.index[-1]
+                bar_id = getattr(current_bar, "value", current_bar)
+                if isinstance(bar_id, pd.Timestamp):
+                    bar_id = bar_id.value
                 key = (symbol, tf_name)
-                if _last_alerted_bar.get(key) == current_bar:
+                if _last_alerted_bar.get(key) == bar_id:
                     continue
-                _last_alerted_bar[key] = current_bar
+                _last_alerted_bar[key] = bar_id
+                try:
+                    latest_close = float(df["Close"].iloc[-1])
+                except (TypeError, ValueError, IndexError):
+                    pass
                 label = tf_config["label"]
+                try:
+                    bar_ts = pd.Timestamp(current_bar)
+                    bar_str = bar_ts.strftime("%d %b %Y %H:%M")
+                except Exception:
+                    bar_str = str(current_bar)
                 if direction == "bullish":
-                    bullish_tfs.append(label)
+                    bullish_tfs.append((label, bar_str))
                 elif direction == "bearish":
-                    bearish_tfs.append(label)
+                    bearish_tfs.append((label, bar_str))
             parts = []
             labels_for_summary = []
             if bullish_tfs:
                 strength = _strength_from_count(len(bullish_tfs))
-                tf_str = ", ".join(bullish_tfs)
-                parts.append(f"📈 {strength} Bullish ({tf_str})")
+                emoji = _strength_emoji(strength)
+                tf_str = ", ".join(lbl for lbl, _ in bullish_tfs)
+                bar_times = " | ".join(f"{lbl}: {bt}" for lbl, bt in bullish_tfs)
+                parts.append(f"{emoji} 📈 {strength} Bullish · {tf_str}")
+                parts.append(f"   Candle: {bar_times}")
                 labels_for_summary.append(f"{strength} Bullish ({tf_str})")
             if bearish_tfs:
                 strength = _strength_from_count(len(bearish_tfs))
-                tf_str = ", ".join(bearish_tfs)
-                parts.append(f"📉 {strength} Bearish ({tf_str})")
+                emoji = _strength_emoji(strength)
+                tf_str = ", ".join(lbl for lbl, _ in bearish_tfs)
+                bar_times = " | ".join(f"{lbl}: {bt}" for lbl, bt in bearish_tfs)
+                parts.append(f"{emoji} 📉 {strength} Bearish · {tf_str}")
+                parts.append(f"   Candle: {bar_times}")
                 labels_for_summary.append(f"{strength} Bearish ({tf_str})")
             if parts:
-                msg = f"KST · {symbol} · {now.strftime('%H:%M IST')}\n" + "\n".join(parts)
+                msg_lines = [
+                    f"🔔 KST Crossover · {symbol}",
+                    f"Checked: {now.strftime('%d %b %Y · %H:%M IST')}",
+                ]
+                if latest_close is not None:
+                    msg_lines.append(f"Last: {latest_close:,.2f}")
+                msg_lines.append("")
+                msg_lines.extend(parts)
+                msg = "\n".join(msg_lines)
                 send_telegram(msg)
                 for lbl in labels_for_summary:
+                    if symbol not in hourly_crossovers:
+                        hourly_crossovers[symbol] = []
                     hourly_crossovers[symbol].append(lbl)
         except Exception as e:
             log.exception("Error processing %s: %s", symbol, e)
@@ -282,78 +307,30 @@ def check_crossovers():
             time.sleep(FETCH_DELAY_SECONDS)
 
 # ==============================
-# Hourly Summary
+# Hourly Summary (every hour, NSE/BSE/global; only send if different from last)
 # ==============================
+_last_hourly_summary = None
+
+
 def send_hourly_summary():
-    now = datetime.now(IST)
-    market_open, market_close = _market_hours(now)
-    if market_open <= now <= market_close:
-        lines = []
-        for symbol in symbols:
-            events = hourly_crossovers[symbol]
-            if not events:
-                continue
-            # Group by label e.g. "Strong Bullish", "Mild Bearish"
-            counts = Counter(events)
-            parts = [f"{cnt} {label}" for label, cnt in counts.most_common()]
-            lines.append(f"• {symbol}: " + ", ".join(parts))
-            hourly_crossovers[symbol] = []
-        if lines:
-            message = f"⏰ Hourly update {now.strftime('%H:%M IST')}\n" + "\n".join(lines)
-            send_telegram(message)
-
-# ==============================
-# Market Status Reminder
-# ==============================
-def _next_market_open(now):
-    """Next NSE open (09:15 IST) on a weekday. Skips Sat/Sun."""
-    # Ensure we work in IST (in case server is UTC)
-    if now.tzinfo is None:
-        now = IST.localize(now)
-    else:
-        now = now.astimezone(IST)
-    market_open, market_close = _market_hours(now)
-    # Before 09:15 today and today is Mon–Fri → open today
-    if now.weekday() < 5 and now < market_open:
-        return market_open
-    # After 15:30 or weekend → next trading day only (Mon=0 .. Fri=4, skip Sat=5, Sun=6)
-    days_ahead = 1
-    for _ in range(7):
-        next_date = now.date() + timedelta(days=days_ahead)
-        wd = next_date.weekday()  # Mon=0, Tue=1, ..., Fri=4, Sat=5, Sun=6
-        if wd <= 4:
-            next_open_naive = datetime(
-                next_date.year, next_date.month, next_date.day,
-                MARKET_OPEN_TIME[0], MARKET_OPEN_TIME[1], 0, 0,
-            )
-            return IST.localize(next_open_naive)
-        days_ahead += 1
-    return market_open
-
-
-def market_status_reminder():
-    # Use UTC then convert to IST so server timezone (e.g. Railway UTC) doesn't affect result
+    global _last_hourly_summary
     now = datetime.now(pytz.UTC).astimezone(IST)
-    market_open, market_close = _market_hours(now)
-    if now.weekday() >= 5:
-        next_open = _next_market_open(now)
-        delta = next_open - now
-        hours_left = round(delta.total_seconds() / 3600, 1)
-        next_str = next_open.strftime("%A %d %b at %I:%M %p IST")
-        send_telegram(f"⏰ NSE closed (weekend). Opens in {hours_left} hrs → {next_str}")
-    elif now < market_open:
-        next_open = _next_market_open(now)
-        delta = next_open - now
-        hours_left = round(delta.total_seconds() / 3600, 1)
-        next_str = next_open.strftime("%A %d %b at %I:%M %p IST")
-        send_telegram(f"⏰ Market closed. Opens in {hours_left} hrs → {next_str}")
-    elif now > market_close:
-        next_open = _next_market_open(now)
-        delta = next_open - now
-        hours_left = round(delta.total_seconds() / 3600, 1)
-        next_str = next_open.strftime("%A %d %b at %I:%M %p IST")
-        # Friday evening → next open is Monday (not Saturday)
-        send_telegram(f"⏰ Market closed. Next trading day in {hours_left} hrs → {next_str}")
+    lines = []
+    for symbol in symbols:
+        events = hourly_crossovers.get(symbol, [])
+        if not events:
+            continue
+        counts = Counter(events)
+        parts = [f"{cnt} {label}" for label, cnt in counts.most_common()]
+        lines.append(f"• {symbol}: " + ", ".join(parts))
+        hourly_crossovers[symbol] = []
+    if not lines:
+        return
+    message = f"⏰ Hourly update {now.strftime('%H:%M IST')}\n" + "\n".join(lines)
+    if message == _last_hourly_summary:
+        return
+    _last_hourly_summary = message
+    send_telegram(message)
 
 # ==============================
 # Scheduler Setup
@@ -361,7 +338,6 @@ def market_status_reminder():
 def run_scheduler():
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(check_crossovers)
     schedule.every().hour.at(":00").do(send_hourly_summary)
-    schedule.every().hour.at(":00").do(market_status_reminder)
     while True:
         schedule.run_pending()
         time.sleep(5)
@@ -371,7 +347,7 @@ def _start_background_scheduler():
     """Start scheduler thread (runs on import so gunicorn + scheduler work)."""
     t = threading.Thread(target=run_scheduler, daemon=True)
     t.start()
-    log.info("Scheduler started at %s", datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"))
+    log.info("Scheduler started at %s", datetime.now(pytz.UTC).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S IST"))
     log.info("Monitoring %d symbols (every %s min)", len(symbols), CHECK_INTERVAL_MINUTES)
     send_telegram("🚀 Trading Bot Started and Running 24/7!")
 
