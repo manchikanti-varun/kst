@@ -38,6 +38,8 @@ logging.basicConfig(
     stream=sys.stdout,  # stdout so Railway shows as info, not error
 )
 log = logging.getLogger(__name__)
+# Suppress yfinance "No data found, symbol may be delisted" spam (invalid/unavailable symbols)
+logging.getLogger("yfinance").setLevel(logging.WARNING)
 
 # ==============================
 # Flask App
@@ -98,6 +100,8 @@ STRENGTH_BY_COUNT = {3: "Strong", 2: "Medium", 1: "Mild"}
 # Data Cache (key: (symbol, interval))
 # ==============================
 data_cache = {}
+# Log "no data" only once per (symbol, interval) per process to avoid log spam
+_data_warned = set()
 
 
 def _normalize_df(df):
@@ -114,7 +118,7 @@ def _normalize_df(df):
 
 def get_data(symbol, interval, period):
     """Fetch stock data with caching for the given interval."""
-    global data_cache
+    global data_cache, _data_warned
     key = (symbol, interval)
     try:
         if key not in data_cache:
@@ -130,8 +134,22 @@ def get_data(symbol, interval, period):
                     combined = pd.concat([data_cache[key], latest])
                     data_cache[key] = combined[~combined.index.duplicated(keep="last")].iloc[-500:]
         out = data_cache.get(key)
-        return out if out is not None and not out.empty else pd.DataFrame()
+        if out is None or out.empty:
+            if key not in _data_warned:
+                _data_warned.add(key)
+                log.warning(
+                    "No price data for %s (interval=%s). Check symbol on Yahoo Finance or remove from symbols.txt",
+                    symbol, interval,
+                )
+            return pd.DataFrame()
+        return out
     except Exception as e:
+        err_msg = str(e).lower()
+        if "no data" in err_msg or "delisted" in err_msg:
+            if key not in _data_warned:
+                _data_warned.add(key)
+                log.warning("No data for %s (%s): %s", symbol, interval, e)
+            return pd.DataFrame()
         log.exception("Error fetching %s %s: %s", symbol, interval, e)
         return pd.DataFrame()
 
