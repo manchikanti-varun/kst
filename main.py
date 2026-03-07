@@ -93,8 +93,8 @@ TIMEFRAMES = {
     "daily": {"interval": "1d", "period": "1y", "label": "Daily"},
     "hourly": {"interval": "1h", "period": "90d", "label": "Hourly"},  # 1-hour bars
 }
-# Strength by count of agreeing timeframes
-STRENGTH_BY_COUNT = {3: "Strong", 2: "Medium", 1: "Mild"}
+# Hourly = trigger (crossover); Daily/Weekly = trend only (KST vs Signal on last bar).
+# Strength: Strong = D+W align with trigger; Medium = one aligns; Mild = both oppose.
 
 # ==============================
 # Data Cache (key: (symbol, interval))
@@ -206,14 +206,8 @@ hourly_crossovers = {s: [] for s in symbols}
 _last_alerted_bar = {}
 
 # ==============================
-# Main Crossover Check (weekly / daily / hourly → Strong / Medium / Mild)
+# KST Logic: Hourly = trigger (crossover); Daily/Weekly = trend only
 # ==============================
-def _market_hours(now):
-    open_ = now.replace(hour=MARKET_OPEN_TIME[0], minute=MARKET_OPEN_TIME[1], second=0, microsecond=0)
-    close = now.replace(hour=MARKET_CLOSE_TIME[0], minute=MARKET_CLOSE_TIME[1], second=0, microsecond=0)
-    return open_, close
-
-
 def _crossover_direction(kst, signal):
     """Returns 'bullish', 'bearish', or None if no crossover on last bar.
     KST above signal = bullish, KST below signal = bearish. Ignores NaN."""
@@ -234,91 +228,155 @@ def _crossover_direction(kst, signal):
     return None
 
 
-def _strength_from_count(n):
-    """3 timeframes → Strong, 2 → Medium, 1 → Mild."""
-    return STRENGTH_BY_COUNT.get(n, "Mild")
+def _trend(kst, signal):
+    """Trend on latest bar: KST > Signal → bullish, KST < Signal → bearish. For Daily/Weekly only."""
+    if kst is None or signal is None or len(kst) < 1:
+        return None
+    k, s = kst.iloc[-1], signal.iloc[-1]
+    if pd.isna(k) or pd.isna(s):
+        return None
+    if k > s:
+        return "bullish"
+    if k < s:
+        return "bearish"
+    return None
 
 
-def _strength_emoji(strength):
-    """Visual indicator for signal strength."""
-    return {"Strong": "🔥", "Medium": "◀️", "Mild": "▪️"}.get(strength, "▪️")
+def _signal_strength(trigger_direction, daily_trend, weekly_trend):
+    """
+    Classify strength from hourly trigger + daily/weekly trends.
+    Returns e.g. 'Strong Bullish', 'Medium Bearish', 'Mild Bullish'.
+    """
+    if trigger_direction not in ("bullish", "bearish"):
+        return None
+    d_bull = daily_trend == "bullish"
+    d_bear = daily_trend == "bearish"
+    w_bull = weekly_trend == "bullish"
+    w_bear = weekly_trend == "bearish"
+    if trigger_direction == "bullish":
+        if d_bull and w_bull:
+            return "Strong Bullish"
+        if (d_bull and w_bear) or (d_bear and w_bull):
+            return "Medium Bullish"
+        if d_bear and w_bear:
+            return "Mild Bullish"
+    else:  # bearish
+        if d_bear and w_bear:
+            return "Strong Bearish"
+        if (d_bear and w_bull) or (d_bull and w_bear):
+            return "Medium Bearish"
+        if d_bull and w_bull:
+            return "Mild Bearish"
+    return "Mild " + ("Bullish" if trigger_direction == "bullish" else "Bearish")
+
+
+def _strength_emoji(strength_label):
+    """Visual indicator for signal strength (Strong/Medium/Mild)."""
+    if "Strong" in (strength_label or ""):
+        return "🔥"
+    if "Medium" in (strength_label or ""):
+        return "◀️"
+    return "▪️"
 
 
 def check_crossovers():
-    """Run 24/7. Any crossover → one alert per new candle (no 9:15–15:30 restriction, no spam)."""
+    """
+    Run 24/7. Alert only when Hourly KST crossover occurs.
+    Daily and Weekly used only for trend (KST vs Signal); strength from alignment.
+    One alert per new hourly candle.
+    """
     global _last_alerted_bar
     now = datetime.now(pytz.UTC).astimezone(IST)
     for symbol in symbols:
         try:
-            bullish_tfs = []
-            bearish_tfs = []
-            latest_close = None
+            # Fetch all three timeframes
+            data = {}
             for tf_name, tf_config in TIMEFRAMES.items():
                 df = get_data(symbol, tf_config["interval"], tf_config["period"])
                 if df is None or df.empty or len(df) < 2:
+                    data[tf_name] = None
                     continue
                 kst_signal = calculate_kst(df)
                 if not kst_signal:
+                    data[tf_name] = None
                     continue
-                kst, signal = kst_signal
-                direction = _crossover_direction(kst, signal)
-                if not direction:
-                    continue
-                current_bar = df.index[-1]
-                bar_id = getattr(current_bar, "value", current_bar)
-                if isinstance(bar_id, pd.Timestamp):
-                    bar_id = bar_id.value
-                key = (symbol, tf_name)
-                if _last_alerted_bar.get(key) == bar_id:
-                    continue
-                _last_alerted_bar[key] = bar_id
-                try:
-                    latest_close = float(df["Close"].iloc[-1])
-                except (TypeError, ValueError, IndexError):
-                    pass
-                label = tf_config["label"]
-                try:
-                    bar_ts = pd.Timestamp(current_bar)
-                    bar_str = bar_ts.strftime("%d %b %Y %H:%M")
-                except Exception:
-                    bar_str = str(current_bar)
-                if direction == "bullish":
-                    bullish_tfs.append((label, bar_str))
-                elif direction == "bearish":
-                    bearish_tfs.append((label, bar_str))
-            parts = []
-            labels_for_summary = []
-            if bullish_tfs:
-                strength = _strength_from_count(len(bullish_tfs))
-                emoji = _strength_emoji(strength)
-                tf_str = ", ".join(lbl for lbl, _ in bullish_tfs)
-                bar_times = " | ".join(f"{lbl}: {bt}" for lbl, bt in bullish_tfs)
-                parts.append(f"{emoji} 📈 {strength} Bullish · {tf_str}")
-                parts.append(f"   Candle: {bar_times}")
-                labels_for_summary.append(f"{strength} Bullish ({tf_str})")
-            if bearish_tfs:
-                strength = _strength_from_count(len(bearish_tfs))
-                emoji = _strength_emoji(strength)
-                tf_str = ", ".join(lbl for lbl, _ in bearish_tfs)
-                bar_times = " | ".join(f"{lbl}: {bt}" for lbl, bt in bearish_tfs)
-                parts.append(f"{emoji} 📉 {strength} Bearish · {tf_str}")
-                parts.append(f"   Candle: {bar_times}")
-                labels_for_summary.append(f"{strength} Bearish ({tf_str})")
-            if parts:
-                msg_lines = [
-                    f"🔔 KST Crossover · {symbol}",
-                    f"Checked: {now.strftime('%d %b %Y · %H:%M IST')}",
-                ]
-                if latest_close is not None:
-                    msg_lines.append(f"Last: {latest_close:,.2f}")
-                msg_lines.append("")
-                msg_lines.extend(parts)
-                msg = "\n".join(msg_lines)
-                send_telegram(msg)
-                for lbl in labels_for_summary:
-                    if symbol not in hourly_crossovers:
-                        hourly_crossovers[symbol] = []
-                    hourly_crossovers[symbol].append(lbl)
+                data[tf_name] = {"df": df, "kst": kst_signal[0], "signal": kst_signal[1], "config": tf_config}
+
+            hourly_data = data.get("hourly")
+            if not hourly_data:
+                continue
+
+            # Trigger only on hourly crossover
+            h_dir = _crossover_direction(hourly_data["kst"], hourly_data["signal"])
+            if not h_dir:
+                continue
+
+            # Dedupe: one alert per new hourly candle
+            h_df = hourly_data["df"]
+            current_bar = h_df.index[-1]
+            bar_id = getattr(current_bar, "value", current_bar)
+            if isinstance(bar_id, pd.Timestamp):
+                bar_id = bar_id.value
+            key = (symbol, "hourly")
+            if _last_alerted_bar.get(key) == bar_id:
+                continue
+            _last_alerted_bar[key] = bar_id
+
+            # Daily and Weekly: trend only (no crossover)
+            daily_data = data.get("daily")
+            weekly_data = data.get("weekly")
+            daily_trend = _trend(daily_data["kst"], daily_data["signal"]) if daily_data else None
+            weekly_trend = _trend(weekly_data["kst"], weekly_data["signal"]) if weekly_data else None
+
+            # Classify strength from trigger + trends
+            strength_label = _signal_strength(h_dir, daily_trend, weekly_trend)
+            if not strength_label:
+                strength_label = "Mild " + ("Bullish" if h_dir == "bullish" else "Bearish")
+
+            # Latest price from hourly
+            latest_close = None
+            try:
+                latest_close = float(h_df["Close"].iloc[-1])
+            except (TypeError, ValueError, IndexError):
+                pass
+
+            # Format trend for display (capitalize, or "—" if missing)
+            def _trend_str(t):
+                if t == "bullish":
+                    return "Bullish"
+                if t == "bearish":
+                    return "Bearish"
+                return "—"
+
+            # Currency: ₹ for NSE/BSE (.NS, .BO), $ for others
+            currency = "₹" if symbol.endswith(".NS") or symbol.endswith(".BO") else "$"
+            price_str = f"Price: {currency}{latest_close:,.2f}" if latest_close is not None else "Price: —"
+
+            trigger_text = "Hourly Bullish Crossover" if h_dir == "bullish" else "Hourly Bearish Crossover"
+            emoji = _strength_emoji(strength_label)
+            time_str = now.strftime("%d %b %Y · %H:%M IST")
+
+            msg_lines = [
+                "🔔 KST SIGNAL",
+                "",
+                f"Symbol: {symbol}",
+                price_str,
+                "",
+                f"Signal: {emoji} {strength_label}",
+                "",
+                f"Trigger: {trigger_text}",
+                f"Daily Trend: {_trend_str(daily_trend)}",
+                f"Weekly Trend: {_trend_str(weekly_trend)}",
+                "",
+                f"Time: {time_str}",
+            ]
+            msg = "\n".join(msg_lines)
+            send_telegram(msg)
+
+            # For hourly summary
+            if symbol not in hourly_crossovers:
+                hourly_crossovers[symbol] = []
+            hourly_crossovers[symbol].append(strength_label)
         except Exception as e:
             log.exception("Error processing %s: %s", symbol, e)
         if FETCH_DELAY_SECONDS > 0:
